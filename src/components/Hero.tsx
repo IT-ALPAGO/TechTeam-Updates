@@ -5,7 +5,7 @@ export function Hero() {
         <span>Alpago Technology</span>
         <i />
       </div>
-      <h1>Project Portfolio</h1>
+      <h1>Project Status</h1>
       <p className="sub">Real-time overview of our technology initiatives and progress.</p>
     </div>
   );
