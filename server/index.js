@@ -84,6 +84,8 @@ const FIELDS = [
 const MAX_PAGES = 12;      // hard ceiling: 12 * 100 = 1200 issues per refresh
 const PAGE_SIZE = 100;
 const CACHE_MS = 60_000;   // Jira rate limits; one minute of caching is plenty
+const CHANGELOG_CAP = 600; // issues to pull history for in one refresh
+const PER_ISSUE_CAP = 120; // only fall back to per-issue calls below this
 
 /* ------------------------------------------------------------------- cache */
 
@@ -185,6 +187,98 @@ async function searchAll(jql) {
   return { issues, truncated: Boolean(nextPageToken) };
 }
 
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+/**
+ * Fetch issue history.
+ *
+ * `expand: changelog` on /search/jql is NOT honoured — the enhanced search API
+ * dropped expand options by design, and silently returns issues with no
+ * changelog rather than erroring. That silence is why status movement showed
+ * as zero. The supported route is the dedicated changelog endpoint:
+ * /rest/api/3/changelog/bulkfetch, with a per-issue fallback for sites where
+ * the bulk endpoint is unavailable.
+ *
+ * Returns a Map of issueId -> changeHistories[].
+ */
+async function fetchChangelogs(issues) {
+  const byId = new Map();
+  const capped = issues.slice(0, CHANGELOG_CAP);
+  const ids = capped.map((i) => i.id).filter(Boolean);
+  if (!ids.length) return { byId, ok: true };
+
+  // Preferred: one call per 100 issues.
+  try {
+    for (const group of chunk(ids, 100)) {
+      let nextPageToken;
+      let guard = 0;
+      do {
+        const body = await jira('/rest/api/3/changelog/bulkfetch', {
+          method: 'POST',
+          body: JSON.stringify({
+            issueIdsOrKeys: group,
+            maxResults: 1000,
+            ...(nextPageToken ? { nextPageToken } : {}),
+          }),
+        });
+        for (const entry of body.issueChangeLogs || []) {
+          const key = String(entry.issueId);
+          const list = byId.get(key) || [];
+          list.push(...(entry.changeHistories || []));
+          byId.set(key, list);
+        }
+        nextPageToken = body.nextPageToken;
+        guard += 1;
+      } while (nextPageToken && guard < 10);
+    }
+    return { byId, ok: true };
+  } catch (err) {
+    console.warn(`  changelog/bulkfetch unavailable (${err.message}); falling back`);
+  }
+
+  // Fallback: one call per issue, bounded, with a little concurrency.
+  if (capped.length > PER_ISSUE_CAP) return { byId, ok: false };
+  const queue = [...capped];
+  const workers = Array.from({ length: 6 }, async () => {
+    while (queue.length) {
+      const issue = queue.shift();
+      if (!issue) return;
+      try {
+        const body = await jira(
+          `/rest/api/3/issue/${encodeURIComponent(issue.key)}/changelog?maxResults=100`,
+        );
+        byId.set(String(issue.id), body.values || []);
+      } catch {
+        /* one issue failing must not sink the refresh */
+      }
+    }
+  });
+  await Promise.all(workers);
+  return { byId, ok: byId.size > 0 };
+}
+
+/** Status changes only — assignee, rank and field edits are not "work moved". */
+function statusTransitions(issue) {
+  const out = [];
+  for (const h of issue.changeHistories || []) {
+    for (const item of h.items || []) {
+      if (item.field !== 'status') continue;
+      if (!item.fromString || !item.toString) continue;
+      out.push({
+        at: h.created,
+        from: item.fromString,
+        to: item.toString,
+        by: h.author?.displayName || null,
+      });
+    }
+  }
+  return out;
+}
+
 /** Strip Jira's payload down to what the dashboard actually renders. */
 function slim(issue) {
   const f = issue.fields || {};
@@ -204,7 +298,23 @@ function slim(issue) {
     assignee: f.assignee?.displayName || null,
     priority: f.priority?.name || null,
     issueType: f.issuetype?.name || null,
+    transitions: statusTransitions(issue),
   };
+}
+
+/**
+ * Jira's changelog records status *names* but not their categories, so build a
+ * name -> category lookup from the statuses actually present in this result
+ * set. That is how a custom status like "For review" or "CLARIFICATION" gets
+ * classified without hardcoding this site's workflow.
+ */
+function statusCategoryMap(issues) {
+  const map = {};
+  for (const issue of issues) {
+    const st = issue.fields?.status;
+    if (st?.name && st.statusCategory?.name) map[st.name] = st.statusCategory.name;
+  }
+  return map;
 }
 
 /* --------------------------------------------------------------------- app */
@@ -249,10 +359,18 @@ app.get('/api/issues', async (req, res) => {
   try {
     const payload = await cached(`issues:${days}`, CACHE_MS, async () => {
       const { issues, truncated } = await searchAll(buildJql(days));
+
+      const { byId, ok: withChangelog } = await fetchChangelogs(issues);
+      for (const issue of issues) {
+        issue.changeHistories = byId.get(String(issue.id)) || [];
+      }
+
       return {
         days,
         fetchedAt: new Date().toISOString(),
         truncated,
+        withChangelog,
+        statusCategories: statusCategoryMap(issues),
         count: issues.length,
         issues: issues.map(slim),
       };

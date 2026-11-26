@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { BarsIcon } from './Icons';
-import { closedAt, timeAgo } from '../lib/metrics';
+import { timeAgo } from '../lib/metrics';
 import {
   MAX_SERIES,
   OTHER_COLOR,
@@ -8,26 +8,44 @@ import {
   colorFor,
   registerProjects,
 } from '../lib/projectColors';
-import type { DayBucket, Metrics } from '../types';
+import type { DayBucket, Measure, Metrics } from '../types';
+
+const MEASURES: { id: Measure; label: string; noun: string }[] = [
+  { id: 'moved', label: 'All movement', noun: 'status changes' },
+  { id: 'started', label: 'Started', noun: 'moved into progress' },
+  { id: 'completed', label: 'Completed', noun: 'completed' },
+];
+
 
 interface Props {
   metrics: Metrics | null;
   loading: boolean;
   siteUrl: string;
   rangeLabel: string;
+  measure: Measure;
+  onMeasure: (m: Measure) => void;
 }
 
-export function DailyBreakdown({ metrics, loading, siteUrl, rangeLabel }: Props) {
+export function DailyBreakdown({
+  metrics,
+  loading,
+  siteUrl,
+  rangeLabel,
+  measure,
+  onMeasure,
+}: Props) {
   const [picked, setPicked] = useState<string | null>(null);
   const [showTable, setShowTable] = useState(false);
 
-  // Reset the drill-down when the underlying window changes.
-  useEffect(() => setPicked(null), [rangeLabel]);
+  // Reset the drill-down when the window or the measure changes.
+  useEffect(() => setPicked(null), [rangeLabel, measure]);
 
   const series = useMemo(() => {
     if (!metrics) return [];
-    registerProjects(metrics.closedByProject.map((p) => p.key));
     const top = metrics.closedByProject.slice(0, MAX_SERIES);
+    // Register exactly the series that will be drawn, so each gets a hue and
+    // grey is only ever "Other".
+    registerProjects(top.map((p) => p.key));
     const rest = metrics.closedByProject.slice(MAX_SERIES);
     const out = top.map((p) => ({ key: p.key, name: p.name, closed: p.closed, color: colorFor(p.key) }));
     if (rest.length) {
@@ -45,6 +63,7 @@ export function DailyBreakdown({ metrics, loading, siteUrl, rangeLabel }: Props)
   const daily = metrics?.daily ?? [];
   const max = Math.max(...daily.map((d) => d.closed), 1);
   const grainWord = metrics?.grain === 'week' ? 'week' : 'day';
+  const active = MEASURES.find((m) => m.id === measure) ?? MEASURES[0];
 
   const selected = daily.find((d) => d.date === picked) ?? null;
   const best = daily.reduce<DayBucket | null>(
@@ -74,11 +93,24 @@ export function DailyBreakdown({ metrics, loading, siteUrl, rangeLabel }: Props)
       <header className="chead">
         <div className="t">
           <BarsIcon />
-          Completed per {grainWord}
+          Work moved per {grainWord}
         </div>
         <div className="dhead-right">
+          <div className="seg-ctl" role="group" aria-label="What to count">
+            {MEASURES.map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                className={m.id === measure ? 'on' : undefined}
+                aria-pressed={m.id === measure}
+                onClick={() => onMeasure(m.id)}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
           <span className="clink">
-            {loading ? '—' : `${metrics?.totalClosed ?? 0} closed · ${rangeLabel}`}
+            {loading ? '—' : `${metrics?.totalClosed ?? 0} ${active.noun} · ${rangeLabel}`}
           </span>
           <button
             type="button"
@@ -93,8 +125,18 @@ export function DailyBreakdown({ metrics, loading, siteUrl, rangeLabel }: Props)
 
       {loading && <div className="empty">Loading completions…</div>}
 
-      {!loading && metrics && metrics.totalClosed === 0 && (
-        <div className="empty">Nothing was completed in this period.</div>
+      {!loading && metrics && !metrics.hasHistory && (
+        <div className="empty">
+          Jira returned no issue history for this period, so status movement
+          cannot be shown. The “Completed” measure still works.
+        </div>
+      )}
+
+      {!loading && metrics && metrics.hasHistory && metrics.totalClosed === 0 && (
+        <div className="empty">
+          No {active.noun} in this period.
+          {measure !== 'moved' && ' Try “All movement”.'}
+        </div>
       )}
 
       {!loading && metrics && metrics.totalClosed > 0 && !showTable && (
@@ -169,7 +211,7 @@ export function DailyBreakdown({ metrics, loading, siteUrl, rangeLabel }: Props)
             <thead>
               <tr>
                 <th>{grainWord === 'week' ? 'Week of' : 'Date'}</th>
-                <th>Closed</th>
+                <th>Count</th>
                 <th>Projects</th>
               </tr>
             </thead>
@@ -197,29 +239,34 @@ export function DailyBreakdown({ metrics, loading, siteUrl, rangeLabel }: Props)
         <div className="drill">
           <div className="drill-head">
             <b>
-              {selected.label} — {selected.closed} completed
+              {selected.label} — {selected.closed} {active.noun}
             </b>
             <button type="button" className="tbtn" onClick={() => setPicked(null)}>
               Close
             </button>
           </div>
           <div className="drill-list">
-            {selected.issues.map((issue) => (
+            {selected.moves.map((move, i) => (
               <a
-                key={issue.key}
+                key={`${move.issueKey}-${move.at}-${i}`}
                 className="drill-row"
-                href={`${siteUrl}/browse/${encodeURIComponent(issue.key)}`}
+                href={`${siteUrl}/browse/${encodeURIComponent(move.issueKey)}`}
                 target="_blank"
                 rel="noopener noreferrer"
               >
-                <i style={{ background: colorFor(issue.projectKey) }} />
-                <span className="k">{issue.key}</span>
-                <span className="s">{issue.summary}</span>
-                <span className="a">{timeAgo(closedAt(issue)?.toISOString() ?? null)}</span>
+                <i style={{ background: colorFor(move.projectKey) }} />
+                <span className="k">{move.issueKey}</span>
+                <span className="s">{move.summary}</span>
+                <span className="move">
+                  <em>{move.from}</em>
+                  <b>→</b>
+                  <em className={`to ${move.kind}`}>{move.to}</em>
+                </span>
+                <span className="a">{timeAgo(move.at)}</span>
               </a>
             ))}
-            {selected.issues.length === 0 && (
-              <div className="empty">Nothing closed on this {grainWord}.</div>
+            {selected.moves.length === 0 && (
+              <div className="empty">Nothing moved on this {grainWord}.</div>
             )}
           </div>
         </div>
@@ -227,8 +274,19 @@ export function DailyBreakdown({ metrics, loading, siteUrl, rangeLabel }: Props)
 
       {!loading && !selected && best && best.closed > 0 && (
         <div className="dfoot">
-          Busiest {grainWord}: <b>{best.label}</b> with {best.closed} completed.
-          Select any column for the task list.
+          Busiest {grainWord}: <b>{best.label}</b> with {best.closed}.{' '}
+          {metrics && measure === 'moved' && (
+            <>
+              Of {metrics.moves.length} status changes: {metrics.kindTotals.started}{' '}
+              started, {metrics.kindTotals.advanced} advanced,{' '}
+              {metrics.kindTotals.completed} completed
+              {metrics.kindTotals.reopened > 0
+                ? `, ${metrics.kindTotals.reopened} reopened`
+                : ''}
+              .{' '}
+            </>
+          )}
+          Select any column for the detail.
         </div>
       )}
     </article>

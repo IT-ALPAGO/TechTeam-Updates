@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { fetchHealth, fetchIssues, type Health } from '../lib/api';
 import { buildMetrics } from '../lib/metrics';
-import type { Metrics, Range } from '../types';
+import type { Measure, Metrics, Range } from '../types';
 
 const REFRESH_MS = 5 * 60_000;
 
@@ -15,8 +15,12 @@ export interface JiraState {
   refresh: () => void;
 }
 
-export function useJira(range: Range): JiraState {
-  const [raw, setRaw] = useState<{ issues: Metrics['issues']; days: number } | null>(null);
+export function useJira(range: Range, measure: Measure): JiraState {
+  const [raw, setRaw] = useState<{
+    issues: Metrics['issues'];
+    days: number;
+    lookup: Record<string, string>;
+  } | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<JiraState['error']>(null);
@@ -44,7 +48,11 @@ export function useJira(range: Range): JiraState {
 
     fetchIssues(range.days, ctrl.signal)
       .then((res) => {
-        setRaw({ issues: res.issues, days: res.days });
+        setRaw({
+          issues: res.issues,
+          days: res.days,
+          lookup: res.statusCategories || {},
+        });
         setTruncated(res.truncated);
         setFetchedAt(new Date(res.fetchedAt));
       })
@@ -68,9 +76,10 @@ export function useJira(range: Range): JiraState {
     return () => clearInterval(id);
   }, [refresh]);
 
+  // Re-derived when the measure changes; no refetch, the history is already here.
   const metrics = useMemo(
-    () => (raw ? buildMetrics(raw.issues, raw.days) : null),
-    [raw],
+    () => (raw ? buildMetrics(raw.issues, raw.days, raw.lookup, measure) : null),
+    [raw, measure],
   );
 
   return { metrics, health, loading, error, fetchedAt, truncated, refresh };

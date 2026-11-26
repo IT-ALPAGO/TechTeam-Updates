@@ -26,9 +26,17 @@ export const MAX_SERIES = SLOTS.length;
 
 const assigned = new Map<string, string>();
 
-/** Register project keys so colours stay stable across range changes. */
+/**
+ * Register the project keys that are about to be drawn, in the order they will
+ * be drawn. Pass only the series that get their own colour — anything beyond
+ * the slot count folds into "Other", so registering the full project list here
+ * would hand slots to projects the chart never shows and leave visible ones grey.
+ *
+ * Assignments are permanent for the session: a project keeps its colour when
+ * the date range changes and the series count shifts.
+ */
 export function registerProjects(keys: string[]): void {
-  for (const key of [...keys].sort()) {
+  for (const key of keys) {
     if (!assigned.has(key) && assigned.size < SLOTS.length) {
       assigned.set(key, SLOTS[assigned.size]);
     }

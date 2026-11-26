@@ -1,4 +1,13 @@
-import type { DayBucket, Issue, Metrics, ProjectRow, StatusCategory } from '../types';
+import type {
+  DayBucket,
+  Issue,
+  Measure,
+  Metrics,
+  Move,
+  MoveKind,
+  ProjectRow,
+  StatusCategory,
+} from '../types';
 
 /**
  * Jira sites customise status names freely — this site alone uses
@@ -24,7 +33,12 @@ function bucketCount(days: number): number {
   return Math.max(7, Math.min(days, 60));
 }
 
-export function buildMetrics(issues: Issue[], days: number): Metrics {
+export function buildMetrics(
+  issues: Issue[],
+  days: number,
+  lookup: Record<string, string> = {},
+  measure: Measure = 'moved',
+): Metrics {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
@@ -53,7 +67,9 @@ export function buildMetrics(issues: Issue[], days: number): Metrics {
         total: 0,
         overdue: 0,
         pct: 0,
+        weighted: 0,
         atRisk: false,
+        last: 0,
       };
       byProject.set(issue.projectKey, row);
     }
@@ -62,6 +78,7 @@ export function buildMetrics(issues: Issue[], days: number): Metrics {
 
     if (issue.updated) {
       const t = new Date(issue.updated).getTime();
+      if (t > row.last) row.last = t;
       if (t >= windowStart) {
         const i = Math.floor((t - windowStart) / msPerBucket);
         if (i >= 0 && i < span) buckets[i] += 1;
@@ -79,12 +96,30 @@ export function buildMetrics(issues: Issue[], days: number): Metrics {
     if (category !== 'done' && isBlocked(issue)) blocked.push(issue);
   }
 
+  const moves = buildMoves(issues, days, lookup);
+
+  // When each project last had a status change — a better risk signal than
+  // completion rate, because a team using "For review" as its final column
+  // would otherwise sit permanently at 0% done and read as At Risk forever.
+  const lastMove = new Map<string, number>();
+  for (const m of moves) {
+    const t = new Date(m.at).getTime();
+    if (t > (lastMove.get(m.projectKey) ?? 0)) lastMove.set(m.projectKey, t);
+  }
+  const STALE_MS = 14 * 86_400_000;
+
   const projects = [...byProject.values()]
     .map((p) => {
       p.pct = p.total ? Math.round((p.done / p.total) * 100) : 0;
-      // A project is flagged when something is past its due date, or when
-      // fewer than half its touched items have landed.
-      p.atRisk = p.overdue > 0 || p.pct < 50;
+      // Started work is real work. A team whose final column is "For review"
+      // would otherwise sit at 0% forever, which is what the Done-only bar did.
+      p.weighted = p.total
+        ? Math.round(((p.done + p.progress * 0.5) / p.total) * 100)
+        : 0;
+      const since = lastMove.get(p.key) ?? p.last;
+      const stale = since ? Date.now() - since > STALE_MS : true;
+      // Flagged when something is overdue, or nothing has moved in a fortnight.
+      p.atRisk = p.overdue > 0 || stale;
       return p;
     })
     .sort((a, b) => b.total - a.total);
@@ -99,8 +134,13 @@ export function buildMetrics(issues: Issue[], days: number): Metrics {
       ? 100
       : 0;
 
-  const { daily, grain } = buildDaily(issues, days);
+  const { daily, grain } = buildDaily(moves, days, measure);
   const totalClosed = daily.reduce((a, b) => a + b.closed, 0);
+
+  const kindTotals: Record<MoveKind, number> = {
+    started: 0, advanced: 0, completed: 0, reopened: 0, back: 0,
+  };
+  for (const m of moves) kindTotals[m.kind] += 1;
 
   const closedTally = new Map<string, { key: string; name: string; closed: number }>();
   for (const b of daily) {
@@ -123,6 +163,9 @@ export function buildMetrics(issues: Issue[], days: number): Metrics {
     grain,
     closedByProject,
     totalClosed,
+    moves,
+    kindTotals,
+    hasHistory: issues.some((i) => (i.transitions?.length ?? 0) > 0),
     totals,
     total,
     pct: total ? Math.round((totals.done / total) * 100) : 0,
@@ -167,7 +210,7 @@ export function formatStamp(date: Date): string {
   }
 }
 
-/* ------------------------------------------------- daily completions ----- */
+/* ----------------------------------------------------- status movement --- */
 
 /** Local YYYY-MM-DD, so buckets line up with the viewer's calendar. */
 function localKey(d: Date): string {
@@ -177,19 +220,82 @@ function localKey(d: Date): string {
 }
 
 /**
- * When an issue was completed. Jira sets `resolutiondate` when a resolution is
- * applied, but team-managed projects often move an issue to a Done status
- * without one — so fall back to `updated` for anything in the Done category.
+ * Classify a status name into a category.
+ *
+ * The changelog gives status *names* only, so we first consult the lookup the
+ * server built from statuses actually present on this site — that is how
+ * "For review" and "CLARIFICATION" resolve correctly. The regexes are only a
+ * fallback for a status no current issue happens to sit in.
  */
-export function closedAt(issue: Issue): Date | null {
-  if (issue.resolved) return new Date(issue.resolved);
-  if (toCategory(issue) === 'done' && issue.updated) return new Date(issue.updated);
-  return null;
+export function categoryOfStatus(
+  name: string,
+  lookup: Record<string, string>,
+): StatusCategory {
+  const known = lookup[name];
+  if (known) {
+    if (/done|complete/i.test(known)) return 'done';
+    if (/progress/i.test(known)) return 'progress';
+    return 'todo';
+  }
+  if (/^(done|closed|complete|resolved|shipped|released)/i.test(name)) return 'done';
+  if (/(progress|review|testing|qa|clarif|doing|dev|blocked|hold)/i.test(name)) return 'progress';
+  return 'todo';
+}
+
+export function classifyMove(
+  from: string,
+  to: string,
+  lookup: Record<string, string>,
+): MoveKind {
+  const a = categoryOfStatus(from, lookup);
+  const b = categoryOfStatus(to, lookup);
+  if (b === 'done') return 'completed';
+  if (a === 'done') return 'reopened';
+  if (a === 'todo' && b === 'progress') return 'started';
+  if (b === 'todo') return 'back';
+  return 'advanced';
+}
+
+/** Flatten every status change in the window into a single ordered list. */
+export function buildMoves(
+  issues: Issue[],
+  days: number,
+  lookup: Record<string, string>,
+): Move[] {
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  start.setDate(start.getDate() - (days - 1));
+  const from = start.getTime();
+
+  const moves: Move[] = [];
+  for (const issue of issues) {
+    for (const t of issue.transitions || []) {
+      const at = new Date(t.at).getTime();
+      if (Number.isNaN(at) || at < from) continue;
+      moves.push({
+        ...t,
+        kind: classifyMove(t.from, t.to, lookup),
+        issueKey: issue.key,
+        summary: issue.summary,
+        projectKey: issue.projectKey,
+        projectName: issue.projectName,
+      });
+    }
+  }
+  moves.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+  return moves;
+}
+
+export function matchesMeasure(kind: MoveKind, measure: Measure): boolean {
+  if (measure === 'completed') return kind === 'completed';
+  if (measure === 'started') return kind === 'started';
+  return true; // 'moved' counts every status change
 }
 
 export function buildDaily(
-  issues: Issue[],
+  moves: Move[],
   days: number,
+  measure: Measure,
 ): { daily: DayBucket[]; grain: 'day' | 'week' } {
   // Past a quarter, one column per day stops being readable.
   const grain: 'day' | 'week' = days > 90 ? 'week' : 'day';
@@ -198,7 +304,7 @@ export function buildDaily(
   const start = new Date();
   start.setHours(0, 0, 0, 0);
   start.setDate(start.getDate() - (days - 1));
-  // Align weekly buckets to the window start, not to an arbitrary weekday.
+
   const buckets: DayBucket[] = [];
   const index = new Map<string, DayBucket>();
 
@@ -207,16 +313,12 @@ export function buildDaily(
     d.setDate(start.getDate() + offset);
     const bucket: DayBucket = {
       date: localKey(d),
-      label:
-        grain === 'week'
-          ? `${d.getDate()} ${d.toLocaleString('en-US', { month: 'short' })}`
-          : d.toLocaleString('en-US', { day: 'numeric', month: 'short' }),
+      label: d.toLocaleString('en-US', { day: 'numeric', month: 'short' }),
       closed: 0,
       byProject: {},
-      issues: [],
+      moves: [],
     };
     buckets.push(bucket);
-    // Map every day in the step onto this bucket.
     for (let k = 0; k < step; k++) {
       const inner = new Date(d);
       inner.setDate(d.getDate() + k);
@@ -224,18 +326,13 @@ export function buildDaily(
     }
   }
 
-  for (const issue of issues) {
-    const when = closedAt(issue);
-    if (!when) continue;
-    const bucket = index.get(localKey(when));
+  for (const move of moves) {
+    if (!matchesMeasure(move.kind, measure)) continue;
+    const bucket = index.get(localKey(new Date(move.at)));
     if (!bucket) continue;
     bucket.closed += 1;
-    bucket.byProject[issue.projectKey] = (bucket.byProject[issue.projectKey] || 0) + 1;
-    bucket.issues.push(issue);
-  }
-
-  for (const b of buckets) {
-    b.issues.sort((x, y) => (closedAt(y)?.getTime() || 0) - (closedAt(x)?.getTime() || 0));
+    bucket.byProject[move.projectKey] = (bucket.byProject[move.projectKey] || 0) + 1;
+    bucket.moves.push(move);
   }
 
   return { daily: buckets, grain };

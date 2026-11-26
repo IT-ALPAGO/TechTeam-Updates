@@ -11,7 +11,7 @@ import { NeedsAttention } from './components/NeedsAttention';
 import { RecentActivity } from './components/RecentActivity';
 import { WarnTriangleIcon } from './components/Icons';
 import { useJira } from './hooks/useJira';
-import type { Range } from './types';
+import type { Measure, Range } from './types';
 
 const RANGES: Range[] = [
   { id: '7', label: 'Last 7 Days', days: 7 },
@@ -23,7 +23,11 @@ const RANGES: Range[] = [
 
 export default function App() {
   const [range, setRange] = useState<Range>(RANGES[1]);
-  const { metrics, health, loading, error, fetchedAt, truncated, refresh } = useJira(range);
+  const [measure, setMeasure] = useState<Measure>('moved');
+  const { metrics, health, loading, error, fetchedAt, truncated, refresh } = useJira(
+    range,
+    measure,
+  );
 
   const siteUrl = useMemo(
     () => health?.siteUrl ?? (health?.site ? `https://${health.site}` : ''),
@@ -89,6 +93,8 @@ export default function App() {
           loading={showSkeleton}
           siteUrl={siteUrl}
           rangeLabel={range.label}
+          measure={measure}
+          onMeasure={setMeasure}
         />
 
         <section className="grid2">
@@ -101,7 +107,7 @@ export default function App() {
         </section>
 
         <section className="grid3">
-          <KeyInsights metrics={metrics} rangeLabel={range.label} />
+          <KeyInsights metrics={metrics} rangeLabel={range.label} days={range.days} />
           <NeedsAttention metrics={metrics} loading={showSkeleton} siteUrl={siteUrl} />
           <RecentActivity
             issues={metrics?.issues ?? []}
