@@ -8,6 +8,8 @@ interface SparklineProps {
 export function Sparkline({ values, fill = 'rgba(255,255,255,.05)', className }: SparklineProps) {
   const w = 116;
   const h = 38;
+
+  
   if (values.length < 2) return <svg className={className} viewBox={`0 0 ${w} ${h}`} />;
 
   const max = Math.max(...values) || 1;
