@@ -57,19 +57,23 @@ export function ProjectsTable({ projects, loading, siteUrl }: Props) {
             </div>
 
             <div className="barcell">
-              <div className="bar">
+              {/* Two segments: finished, then started-but-not-finished. */}
+              <div
+                className="bar split"
+                title={`${p.done} done, ${p.progress} in progress, ${p.todo} to do`}
+              >
+                <i className="done" style={{ width: `${p.pct}%` }} />
                 <i
-                  style={{
-                    width: `${p.pct}%`,
-                    background: p.atRisk
-                      ? 'linear-gradient(90deg,#4e86c9,#6aa8f5)'
-                      : 'linear-gradient(90deg,#3f9b79,#5ad1a5)',
-                  }}
+                  className="wip"
+                  style={{ width: `${p.total ? (p.progress / p.total) * 100 : 0}%` }}
                 />
               </div>
             </div>
 
-            <div className="pct">{p.pct}%</div>
+            <div className="pct">
+              {p.weighted}%
+              {p.weighted !== p.pct && <em title="Finished work only">{p.pct}% done</em>}
+            </div>
             <div className="tasks">
               {p.done} / {p.total}
             </div>

@@ -526,3 +526,11 @@ a.act:hover .t { color: #fff; }
   .drill-row .move { display: none; }
   .dhead-right { flex-wrap: wrap; justify-content: flex-end; }
 }
+
+/* split progress bar: finished + in flight */
+.bar.split { display: flex; gap: 2px; }
+.bar.split i { display: block; height: 100%; border-radius: 99px; flex: 0 0 auto; }
+.bar.split i.done { background: linear-gradient(90deg, #3f9b79, var(--green)); }
+.bar.split i.wip  { background: linear-gradient(90deg, #4e86c9, var(--blue)); opacity: .75; }
+.pct { display: flex; flex-direction: column; align-items: flex-end; line-height: 1.25; }
+.pct em { font-style: normal; font-size: 9.5px; color: var(--tx-faint); }
